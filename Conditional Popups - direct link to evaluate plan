@@ -1,0 +1,439 @@
+/**
+ * Plugin Name: TO Conditional Plan Popups (Module ID + Safe Modal)
+ * Description: Start/Evaluate/Continue per module (GF: Plan=50, Eval=36). Matches by Module ID (F50:9). Deep-links Evaluate. Works when class/attrs are on wrapper or anchor. Safe modal mounting + extreme z-index + ESC close.
+ * Version:     1.5.0
+ * Author:      Triple Orbits
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+/** CONFIG */
+const TO_GF_FORM_PLAN_ID          = 50;
+const TO_GF_FORM_EVAL_ID          = 36;
+const TO_GF_FIELD_PLAN_AIMID      = 1;  // Form 50: AIM ID
+const TO_GF_FIELD_PLAN_MODULE_ID  = 9;  // Form 50: Module ID
+const TO_GF_FIELD_EVAL_AIMID      = 3;  // Form 36: AIM ID
+
+const TO_URL_START_PLAN_BASE = 'https://stage.epilepsy-journey.org/single-page-problem-solving-plan/';
+const TO_URL_EVALUATE_BASE   = 'https://stage.epilepsy-journey.org/evaluate-your-plan/';
+const TO_URL_JOURNEY         = 'https://stage.epilepsy-journey.org/my-journey/';
+const TO_URL_MY_PLANS        = 'https://stage.epilepsy-journey.org/my-plans/';
+
+function to_build_start_url( $module_id ) {
+	$module_id = (string) $module_id;
+	return $module_id !== '' ? add_query_arg( [ 'module-id' => $module_id ], TO_URL_START_PLAN_BASE ) : TO_URL_START_PLAN_BASE;
+}
+function to_build_evaluate_url( $aim_id, $module_id, $entry_id ) {
+	return add_query_arg(
+		[ 'aim-id' => (string) $aim_id, 'module-id' => (string) $module_id, 'entryid' => (string) $entry_id ],
+		TO_URL_EVALUATE_BASE
+	);
+}
+
+function to_decide_for_module_id( $user_id, $module_id ) {
+	$start_url    = to_build_start_url( $module_id );
+	$continue_url = TO_URL_JOURNEY;
+	$evaluate_url = '';
+
+	if ( ! class_exists( 'GFAPI' ) ) {
+		return [ 'state' => 'start', 'start_url' => $start_url, 'evaluate_url' => $evaluate_url, 'continue_url' => $continue_url ];
+	}
+	$module_id = trim( (string) $module_id );
+	if ( $module_id === '' ) {
+		return [ 'state' => 'start', 'start_url' => $start_url, 'evaluate_url' => $evaluate_url, 'continue_url' => $continue_url ];
+	}
+
+	$plan_search = [
+		'status'        => 'active',
+		'field_filters' => [
+			'mode' => 'all',
+			[ 'key' => 'created_by',                        'value' => (string) $user_id ],
+			[ 'key' => (string) TO_GF_FIELD_PLAN_MODULE_ID, 'value' => $module_id ],
+		],
+	];
+
+	try {
+		$plan_entries = GFAPI::get_entries( TO_GF_FORM_PLAN_ID, $plan_search, [ 'key' => 'date_created', 'direction' => 'DESC' ], [ 'page_size' => 200 ] );
+	} catch ( Exception $e ) {
+		$plan_entries = [];
+	}
+
+	if ( empty( $plan_entries ) ) {
+		return [ 'state' => 'start', 'start_url' => $start_url, 'evaluate_url' => $evaluate_url, 'continue_url' => $continue_url ];
+	}
+
+	$per_entry = []; // entry_id => ['aim'=>..., 'module'=>...]
+	$aim_ids   = [];
+
+	foreach ( $plan_entries as $pe ) {
+		$entry_id  = rgar( $pe, 'id' );
+		$aim_id    = rgar( $pe, (string) TO_GF_FIELD_PLAN_AIMID );
+		$mod_id    = rgar( $pe, (string) TO_GF_FIELD_PLAN_MODULE_ID );
+		if ( $entry_id ) {
+			$per_entry[(string) $entry_id] = [ 'aim' => (string) $aim_id, 'module' => (string) $mod_id ];
+			if ( $aim_id !== '' && $aim_id !== null ) $aim_ids[] = (string) $aim_id;
+		}
+	}
+	$aim_ids = array_values( array_unique( $aim_ids ) );
+
+	if ( empty( $aim_ids ) ) {
+		return [ 'state' => 'evaluate', 'start_url' => $start_url, 'evaluate_url' => TO_URL_MY_PLANS, 'continue_url' => $continue_url ];
+	}
+
+	try {
+		$eval_entries = GFAPI::get_entries(
+			TO_GF_FORM_EVAL_ID,
+			[
+				'status'        => 'active',
+				'field_filters' => [ 'mode' => 'all', [ 'key' => 'created_by', 'value' => (string) $user_id ] ],
+			],
+			null,
+			[ 'page_size' => 500 ]
+		);
+	} catch ( Exception $e ) {
+		$eval_entries = [];
+	}
+
+	$have_eval_for = [];
+	foreach ( $eval_entries as $ev ) {
+		$ev_aim = rgar( $ev, (string) TO_GF_FIELD_EVAL_AIMID );
+		if ( $ev_aim !== '' && $ev_aim !== null ) $have_eval_for[(string) $ev_aim] = true;
+	}
+
+	foreach ( $per_entry as $entry_id => $meta ) {
+		$aim = $meta['aim']; $mod = $meta['module'];
+		if ( $aim !== '' && empty( $have_eval_for[$aim] ) ) {
+			$evaluate_url = to_build_evaluate_url( $aim, $mod, $entry_id );
+			return [ 'state' => 'evaluate', 'start_url' => $start_url, 'evaluate_url' => $evaluate_url, 'continue_url' => $continue_url ];
+		}
+	}
+
+	return [ 'state' => 'continue', 'start_url' => $start_url, 'evaluate_url' => $evaluate_url, 'continue_url' => $continue_url ];
+}
+
+add_action( 'rest_api_init', function() {
+	register_rest_route( 'to/v1', '/plan-state', [
+		'methods'             => 'GET',
+		'permission_callback' => function() { return is_user_logged_in(); },
+		'callback'            => function( WP_REST_Request $req ) {
+			$user = wp_get_current_user();
+			if ( ! $user || 0 === $user->ID ) return new WP_REST_Response( [ 'ok' => false, 'error' => 'not_logged_in' ], 401 );
+			$module_id = (string) $req->get_param( 'module_id' );
+			$decision  = to_decide_for_module_id( $user->ID, $module_id );
+			return [
+				'ok'           => true,
+				'state'        => $decision['state'],
+				'start_url'    => $decision['start_url'],
+				'evaluate_url' => $decision['evaluate_url'],
+				'continue_url' => $decision['continue_url'],
+				'meta'         => [ 'module_id' => $module_id ],
+			];
+		},
+	] );
+} );
+
+add_action( 'wp_enqueue_scripts', function() {
+	$handle_js  = 'to-conditional-popups';
+	$handle_css = 'to-conditional-popups-css';
+
+	/* JS */
+	wp_register_script( $handle_js, '', [ 'jquery' ], '1.5.0', true );
+	$rest_url = esc_url_raw( rest_url( 'to/v1/plan-state' ) );
+	$nonce    = wp_create_nonce( 'wp_rest' );
+	wp_add_inline_script( $handle_js, "
+	(function($){
+		var endpoint = '". $rest_url ."';
+		var nonce    = '". esc_js( $nonce ) ."';
+
+		function openElementorPopupById(id){
+			if (window.elementorProFrontend && elementorProFrontend.modules && elementorProFrontend.modules.popup) {
+				try { elementorProFrontend.modules.popup.showPopup({ id: parseInt(id, 10) }); return true; } catch(e){}
+			}
+			return false;
+		}
+		function setFallbackHref(state, href){
+			var sel = {start:'#to-fallback-modal-start a.to-action', evaluate:'#to-fallback-modal-evaluate a.to-action', continue:'#to-fallback-modal-continue a.to-action'}[state];
+			if (sel && href) $(sel).attr('href', href);
+		}
+		function openFallback(state){
+			var id = '#to-fallback-modal-' + state;
+			var \$m = $(id);
+			if (!\$m.length) return;
+
+			// Append to <body> to escape transformed/overflow ancestors
+			if (!\$m.data('mounted-to-body')) {
+				\$m.detach().appendTo('body').data('mounted-to-body', true);
+			}
+			\$m.addClass('to-modal-open');
+
+			// If somehow invisible (e.g., CSS collision), auto-unlock to avoid trapping the user
+			setTimeout(function(){
+				if (!\$m.is(':visible') || \$m[0].getBoundingClientRect().width === 0) {
+					\$m.removeClass('to-modal-open');
+					$('body').removeClass('to-modal-lock');
+				}
+			}, 50);
+
+			$('body').addClass('to-modal-lock').attr('data-to-modal-open', state);
+			// Focus trap start
+			try { \$m.attr('tabindex','-1').focus(); } catch(e){}
+		}
+		function fetchDecision(moduleId){
+			return $.ajax({
+				url: endpoint, method: 'GET',
+				data: { module_id: moduleId || '' },
+				beforeSend: function(xhr){ xhr.setRequestHeader('X-WP-Nonce', nonce); }
+			});
+		}
+
+		// Wrapper OR inner <a>
+		$(document).on('click', '.to-conditional-popup, .to-conditional-popup a', function(ev){
+			if (ev.which && ev.which !== 1) return;
+			var \$root = $(ev.target).closest('.to-conditional-popup'); if (!\$root.length) return;
+			ev.preventDefault();
+
+			var moduleId = (\$root.data('module-id') || '').toString().replace(/^\"|\"$/g, '');
+			var popupIds = { start:\$root.data('popup-start'), evaluate:\$root.data('popup-evaluate'), continue:\$root.data('popup-continue') };
+
+			fetchDecision(moduleId).done(function(res){
+				if(!res || !res.ok){ openFallback('start'); return; }
+				var state = res.state || 'continue';
+				if (res.start_url)    setFallbackHref('start',    res.start_url);
+				if (res.evaluate_url) setFallbackHref('evaluate', res.evaluate_url);
+				if (res.continue_url) setFallbackHref('continue', res.continue_url);
+
+				var pid = popupIds[state];
+				if (pid && openElementorPopupById(pid)) return;
+				openFallback(state);
+			}).fail(function(){ openFallback('start'); });
+		});
+
+		// Close (X / backdrop / ESC)
+		$(document).on('click', '.to-modal [data-close], .to-modal .to-modal-backdrop', function(){
+			var \$m = $(this).closest('.to-modal');
+			\$m.removeClass('to-modal-open');
+			$('body').removeClass('to-modal-lock').removeAttr('data-to-modal-open');
+		});
+		$(document).on('keydown', function(e){
+			if (e.key === 'Escape') {
+				$('.to-modal.to-modal-open').removeClass('to-modal-open');
+				$('body').removeClass('to-modal-lock').removeAttr('data-to-modal-open');
+			}
+		});
+	})(jQuery);
+	" );
+	wp_enqueue_script( $handle_js );
+
+	/* CSS */
+	wp_register_style( $handle_css, false, [], '1.5.0' );
+	wp_enqueue_style( $handle_css );
+	$css = "
+	.to-modal{position:fixed;inset:0;display:none;z-index:2147483647;pointer-events:none;}
+	.to-modal-open{display:block;pointer-events:auto;}
+	.to-modal-lock{overflow:hidden;}
+	.to-modal .to-modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.45);}
+	.to-modal .to-modal-card{
+		position:relative;max-width:480px;margin:8vh auto;background:#fff;border-radius:16px;
+		box-shadow:0 12px 32px rgba(0,0,0,.25);padding:24px;text-align:center;
+	}
+	.to-modal .to-title{font-weight:700;font-size:20px;margin:4px 0 6px;}
+	.to-modal .to-desc{color:#5f6b7a;margin-bottom:16px;line-height:1.35;}
+	.to-modal .to-btn{display:inline-block;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:600;width:100%;color:white !important;}
+	.to-btn-yellow{background:#f5c542;}
+	.to-btn-blue{background:#2c7be5;}
+	.to-btn-green{background:#2fb344;}
+	.to-close{position:absolute;right:0px;top:0px;border:0;background:transparent !important;font-size:30px !important;cursor:pointer !important;font-weight:700 !important;color:black !important;}
+	";
+	wp_add_inline_style( $handle_css, $css );
+
+	/* Fallback modals (double-hidden) */
+	add_action( 'wp_footer', function(){
+		?>
+		<div id="to-fallback-modal-start" class="to-modal" aria-hidden="true" style="display:none">
+			<div class="to-modal-backdrop" data-close></div>
+			<div class="to-modal-card" role="dialog" aria-modal="true" aria-labelledby="to-start-title">
+				<button class="to-close" data-close aria-label="Close">×</button>
+				<div style="font-size:30px;line-height:1">💡</div>
+				<div id="to-start-title" class="to-title">Ready for a New Plan?</div>
+				<div class="to-desc">Now that you’ve completed your module, create a new plan.</div>
+				<a class="to-btn to-btn-yellow to-action" href="<?php echo esc_url( TO_URL_START_PLAN_BASE ); ?>">Start New Plan</a>
+			</div>
+		</div>
+
+		<div id="to-fallback-modal-evaluate" class="to-modal" aria-hidden="true" style="display:none">
+			<div class="to-modal-backdrop" data-close></div>
+			<div class="to-modal-card" role="dialog" aria-modal="true" aria-labelledby="to-eval-title">
+				<button class="to-close" data-close aria-label="Close">×</button>
+				<div style="font-size:30px;line-height:1">📋</div>
+				<div id="to-eval-title" class="to-title">Evaluate Your Plan</div>
+				<div class="to-desc">You’ve created a plan but haven’t evaluated your progress yet.</div>
+				<a class="to-btn to-btn-blue to-action" href="<?php echo esc_url( TO_URL_MY_PLANS ); ?>">Evaluate Now</a>
+			</div>
+		</div>
+
+		<div id="to-fallback-modal-continue" class="to-modal" aria-hidden="true" style="display:none">
+			<div class="to-modal-backdrop" data-close></div>
+			<div class="to-modal-card" role="dialog" aria-modal="true" aria-labelledby="to-cont-title">
+				<button class="to-close" data-close aria-label="Close">×</button>
+				<div style="font-size:28px;line-height:1">➡️</div>
+				<div id="to-cont-title" class="to-title">Continue Learning</div>
+				<div class="to-desc">Let’s move on to the next module in your journey.</div>
+				<a class="to-btn to-btn-green to-action" href="<?php echo esc_url( TO_URL_JOURNEY ); ?>">Go To My Journey Page</a>
+			</div>
+		</div>
+		<?php
+	});
+});
+
+// --- Ensure modal containers exist EARLY in the DOM ---
+add_action( 'wp_body_open', function () {
+    // Print once and bail if already printed
+    if ( did_action('to_modal_shell_printed') ) return;
+    do_action('to_modal_shell_printed');
+
+    ?>
+    <div id="to-fallback-modal-start" class="to-modal" aria-hidden="true" style="display:none">
+        <div class="to-modal-backdrop" data-close></div>
+        <div class="to-modal-card" role="dialog" aria-modal="true" aria-labelledby="to-start-title">
+            <button class="to-close" data-close aria-label="Close">×</button>
+            <div style="font-size:30px;line-height:1">💡</div>
+            <div id="to-start-title" class="to-title">Ready for a New Plan?</div>
+            <div class="to-desc">Now that you’ve completed your module, create a new plan.</div>
+            <a class="to-btn to-btn-yellow to-action" href="<?php echo esc_url( TO_URL_START_PLAN_BASE ); ?>">Start New Plan</a>
+        </div>
+    </div>
+
+    <div id="to-fallback-modal-evaluate" class="to-modal" aria-hidden="true" style="display:none">
+        <div class="to-modal-backdrop" data-close></div>
+        <div class="to-modal-card" role="dialog" aria-modal="true" aria-labelledby="to-eval-title">
+            <button class="to-close" data-close aria-label="Close">×</button>
+            <div style="font-size:30px;line-height:1">📋</div>
+            <div id="to-eval-title" class="to-title">Evaluate Your Plan</div>
+            <div class="to-desc">You’ve created a plan but haven’t evaluated your progress yet.</div>
+            <a class="to-btn to-btn-blue to-action" href="<?php echo esc_url( TO_URL_MY_PLANS ); ?>">Evaluate Now</a>
+        </div>
+    </div>
+
+    <div id="to-fallback-modal-continue" class="to-modal" aria-hidden="true" style="display:none">
+        <div class="to-modal-backdrop" data-close></div>
+        <div class="to-modal-card" role="dialog" aria-modal="true" aria-labelledby="to-cont-title">
+            <button class="to-close" data-close aria-label="Close">×</button>
+            <div style="font-size:28px;line-height:1">➡️</div>
+            <div id="to-cont-title" class="to-title">Continue Learning</div>
+            <div class="to-desc">Let’s move on to the next module in your journey.</div>
+            <a class="to-btn to-btn-green to-action" href="<?php echo esc_url( TO_URL_JOURNEY ); ?>">Go To My Journey Page</a>
+        </div>
+    </div>
+    <?php
+}, 5);
+
+// Safety net: if something removed them, recreate on demand from JS
+add_action( 'wp_enqueue_scripts', function () {
+    wp_add_inline_script( 'to-conditional-popups', "
+    (function($){
+      function ensureModal(id, html){
+        if (!document.getElementById(id)) {
+          $('body').prepend(html);
+        }
+      }
+      $(function(){
+        ensureModal('to-fallback-modal-start',    '<div id=\"to-fallback-modal-start\" class=\"to-modal\" aria-hidden=\"true\" style=\"display:none\"><div class=\"to-modal-backdrop\" data-close></div><div class=\"to-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"to-start-title\"><button class=\"to-close\" data-close aria-label=\"Close\">×</button><div style=\"font-size:30px;line-height:1\">💡</div><div id=\"to-start-title\" class=\"to-title\">Ready for a New Plan?</div><div class=\"to-desc\">Now that you’ve completed your module, create a new plan.</div><a class=\"to-btn to-btn-yellow to-action\" href=\"".esc_js( TO_URL_START_PLAN_BASE )."\">Start New Plan</a></div></div>');
+        ensureModal('to-fallback-modal-evaluate', '<div id=\"to-fallback-modal-evaluate\" class=\"to-modal\" aria-hidden=\"true\" style=\"display:none\"><div class=\"to-modal-backdrop\" data-close></div><div class=\"to-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"to-eval-title\"><button class=\"to-close\" data-close aria-label=\"Close\">×</button><div style=\"font-size:30px;line-height:1\">📋</div><div id=\"to-eval-title\" class=\"to-title\">Evaluate Your Plan</div><div class=\"to-desc\">You’ve created a plan but haven’t evaluated your progress yet.</div><a class=\"to-btn to-btn-blue to-action\" href=\"".esc_js( TO_URL_MY_PLANS )."\">Evaluate Now</a></div></div>');
+        ensureModal('to-fallback-modal-continue','<div id=\"to-fallback-modal-continue\" class=\"to-modal\" aria-hidden=\"true\" style=\"display:none\"><div class=\"to-modal-backdrop\" data-close></div><div class=\"to-modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"to-cont-title\"><button class=\"to-close\" data-close aria-label=\"Close\">×</button><div style=\"font-size:28px;line-height:1\">➡️</div><div id=\"to-cont-title\" class=\"to-title\">Continue Learning</div><div class=\"to-desc\">Let’s move on to the next module in your journey.</div><a class=\"to-btn to-btn-green to-action\" href=\"".esc_js( TO_URL_JOURNEY )."\">Go To My Journey Page</a></div></div>');
+      });
+    })(jQuery);
+    ");
+}, 20);
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * LOGIN POPUP: “Review Plans that Need Evaluation”
+ * - Sets cookie on login
+ * - Renders modal shell at <body> open
+ * - Opens modal on first page load after login, then clears cookie
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/** Config: where the login popup should send users */
+if ( ! defined( 'TO_URL_LOGIN_EVALS' ) ) {
+	// Use absolute if you prefer: 'https://stage.epilepsy-journey.org/aim-view/#tab-80492'
+	define( 'TO_URL_LOGIN_EVALS', site_url( '/aim-view/#tab-80492' ) );
+}
+
+add_action( 'wp_login', function( $user_login, $user ) {
+    $secure   = is_ssl();
+    $httponly = false; // IMPORTANT: allow JS to read this one
+    $path     = defined( 'COOKIEPATH' ) ? COOKIEPATH : '/';
+    $domain   = defined( 'COOKIE_DOMAIN' ) ? COOKIE_DOMAIN : '';
+
+    // Short-lived cookie to trigger the popup once post-login
+    setcookie( 'to_eval_popup', '1', time() + 60, $path, $domain, $secure, $httponly );
+}, 10, 2 );
+
+
+/** 2) Render the login modal EARLY so JS can open it on first paint */
+add_action( 'wp_body_open', function () {
+	// Print once
+	if ( did_action( 'to_login_modal_printed' ) ) return;
+	do_action( 'to_login_modal_printed' ); ?>
+
+	<div id="to-login-evals-modal" class="to-modal" aria-hidden="true" style="display:none">
+		<div class="to-modal-backdrop" data-close></div>
+		<div class="to-modal-card" role="dialog" aria-modal="true" aria-labelledby="to-login-evals-title">
+			<button class="to-close" data-close aria-label="Close">×</button>
+			<div style="font-size:30px;line-height:1">📋</div>
+			<div id="to-login-evals-title" class="to-title">Evaluate Your Plans</div>
+			<div class="to-desc">You have plans that may need evaluation. Review them now.</div>
+			<a class="to-btn to-btn-blue to-action" href="<?php echo esc_url( TO_URL_LOGIN_EVALS ); ?>">Review Plans</a>
+		</div>
+	</div>
+<?php }, 6 );
+
+/** 3) JS: if the cookie exists after login, open the modal and then clear the cookie */
+add_action( 'wp_enqueue_scripts', function () {
+	// Reuse the already-enqueued handle from your main plugin
+	wp_add_inline_script( 'to-conditional-popups', "
+	(function($){
+		function readCookie(name){
+			var match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()\\[\\]\\\\\\/\\+^])/g, '\\\\$1') + '=([^;]*)'));
+			return match ? decodeURIComponent(match[1]) : null;
+		}
+		function eraseCookie(name){
+			var path = '" . esc_js( defined('COOKIEPATH') ? COOKIEPATH : '/' ) . "';
+			document.cookie = name + '=; Max-Age=-1; path=' + path + ';';
+		}
+		function openMountedModal(id){
+			var \$m = $(id);
+			if (!\$m.length) return;
+			if (!\$m.data('mounted-to-body')) { \$m.detach().appendTo('body').data('mounted-to-body', true); }
+			\$m.addClass('to-modal-open');
+			$('body').addClass('to-modal-lock').attr('data-to-modal-open','login-evals');
+			try { \$m.attr('tabindex','-1').focus(); } catch(e){}
+		}
+
+		$(function(){
+			// Only trigger once right after login
+			if (readCookie('to_eval_popup') === '1') {
+				eraseCookie('to_eval_popup');
+				openMountedModal('#to-login-evals-modal');
+			}
+		});
+	})(jQuery);
+	", 'after' );
+}, 20 );
+
+add_action('wp_enqueue_scripts', function () {
+    wp_add_inline_script('to-conditional-popups', "
+    (function($){
+      $(function(){
+        if (new URLSearchParams(location.search).get('show-eval-popup') === '1') {
+          var \$m = $('#to-login-evals-modal');
+          if (\$m.length) {
+            if (!\$m.data('mounted-to-body')) { \$m.detach().appendTo('body').data('mounted-to-body', true); }
+            \$m.addClass('to-modal-open'); $('body').addClass('to-modal-lock');
+          }
+        }
+      });
+    })(jQuery);
+    ");
+}, 20);
